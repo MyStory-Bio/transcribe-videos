@@ -101,10 +101,6 @@ export default function VideoTranscriber() {
     setIsProcessing(false);
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-  };
-
   const clearAll = () => {
     setJobs([]);
   };
@@ -201,11 +197,10 @@ export default function VideoTranscriber() {
                 )}
 
                 {job.status === 'complete' && job.result && job.result.trim().length > 0 && (
-                  <TranscriptResult 
-                    transcript={job.result} 
+                  <TranscriptResult
+                    transcript={job.result}
                     rawResult={job.rawResult}
                     fileName={job.file.name}
-                    onCopy={() => copyToClipboard(job.result!)}
                   />
                 )}
 

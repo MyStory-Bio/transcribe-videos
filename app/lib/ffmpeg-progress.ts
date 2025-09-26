@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { EventEmitter } from 'events';
 import ffmpegStatic from 'ffmpeg-static';
 import { existsSync } from 'fs';
@@ -12,8 +12,28 @@ interface ProgressData {
   status: 'processing' | 'complete' | 'error';
 }
 
+function findSystemBinary(binary: 'ffmpeg' | 'ffprobe'): string | null {
+  const locator = process.platform === 'win32' ? 'where' : 'which';
+  try {
+    const result = spawnSync(locator, [binary]);
+    if (result.status === 0) {
+      const output = result.stdout.toString().trim().split('\n')[0];
+      if (output) {
+        return output;
+      }
+    }
+  } catch {
+    // Ignore locator errors; we'll fall back to other strategies.
+  }
+  return null;
+}
+
 function getFfmpegPath(): string {
   if (!ffmpegStatic) {
+    const systemBinary = findSystemBinary('ffmpeg');
+    if (systemBinary) {
+      return systemBinary;
+    }
     throw new Error('FFmpeg binary path not available from ffmpeg-static package');
   }
 
@@ -37,6 +57,20 @@ function getFfmpegPath(): string {
         console.log(`Found FFmpeg at: ${altPath}`);
         return altPath;
       }
+    }
+
+    if (process.env.FFMPEG_PATH) {
+      const envPath = process.env.FFMPEG_PATH;
+      if (!envPath.includes('/') || existsSync(envPath)) {
+        console.log(`Using FFmpeg from FFMPEG_PATH: ${envPath}`);
+        return envPath;
+      }
+    }
+
+    const systemBinary = findSystemBinary('ffmpeg');
+    if (systemBinary) {
+      console.log(`Using system FFmpeg binary at: ${systemBinary}`);
+      return systemBinary;
     }
 
     throw new Error(`FFmpeg binary not found. Tried: ${resolvedPath}, ${alternatives.join(', ')}`);
@@ -153,9 +187,14 @@ export class FFmpegProgressTracker extends EventEmitter {
         return;
       }
 
-      const ffprobePath = ffmpegPath.replace('ffmpeg', 'ffprobe');
+      const envProbe = process.env.FFPROBE_PATH;
+      const derivedProbe = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, (_, suffix) => (suffix ? 'ffprobe.exe' : 'ffprobe'));
+      const systemProbe = findSystemBinary('ffprobe');
 
-      if (!existsSync(ffprobePath)) {
+      const candidates = [envProbe, derivedProbe, systemProbe].filter(Boolean) as string[];
+      const ffprobePath = candidates.find(path => !path.includes('/') || existsSync(path)) ?? candidates[0];
+
+      if (!ffprobePath) {
         console.warn('FFprobe not found, using default frame count');
         resolve(1000);
         return;

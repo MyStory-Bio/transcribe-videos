@@ -1,8 +1,281 @@
 'use client';
-import { useState, useMemo } from 'react';
+
+import { useMemo, useState } from 'react';
 import { Check, Copy, Download, FileJson } from 'lucide-react';
 
 type TranscriptMode = 'speaker' | 'segments' | 'plain';
+
+type DeepgramWord = {
+  start: number;
+  end?: number;
+  word: string;
+  punctuated_word?: string;
+  speaker?: number | string;
+};
+
+type DeepgramUtterance = {
+  start: number;
+  end: number;
+  channel?: number;
+  speaker?: number | string | null;
+  transcript: string;
+  words?: DeepgramWord[];
+};
+
+type TurnMode = Exclude<TranscriptMode, 'plain'>;
+
+type Turn = {
+  start: number;
+  end: number;
+  text: string;
+  speakerLabel: string;
+  speakerKey: string;
+  mode: TurnMode;
+  words?: DeepgramWord[];
+};
+
+const SEGMENT_DURATION_SECONDS = 4;
+
+const formatTimestamp = (seconds: number): string => {
+  const minutes = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+};
+
+const normalizeWhitespace = (value: string): string => value.replace(/\s+/g, ' ').trim();
+
+const resolveSpeakerLabel = (speaker: number | string | null | undefined): string => {
+  if (speaker === null || speaker === undefined) {
+    return 'Speaker';
+  }
+
+  if (typeof speaker === 'number') {
+    return `Speaker ${speaker + 1}`;
+  }
+
+  const normalized = speaker.toString().trim();
+  if (!normalized) {
+    return 'Speaker';
+  }
+
+  const numericMatch = normalized.match(/(\d+)/);
+  if (numericMatch) {
+    const numericValue = Number(numericMatch[1]);
+    if (!Number.isNaN(numericValue)) {
+      return `Speaker ${numericValue >= 0 ? numericValue + 1 : numericValue}`;
+    }
+  }
+
+  return normalized.replace(/^speaker[_-]?/i, 'Speaker ').trim() || 'Speaker';
+};
+
+const resolveSpeakerKey = (speaker: number | string | null | undefined, channel?: number): string => {
+  const speakerValue = speaker === null || speaker === undefined ? 'unknown' : String(speaker);
+  return `${channel ?? 'ch0'}|${speakerValue}`;
+};
+
+const mergeTurns = (first: Turn, second: Turn): Turn => {
+  const mergedText = normalizeWhitespace(`${first.text} ${second.text}`);
+  const mergedWords = [
+    ...(first.words ?? []),
+    ...(second.words ?? []),
+  ];
+
+  return {
+    ...first,
+    end: Math.max(first.end, second.end),
+    text: mergedText,
+    words: mergedWords.length > 0 ? mergedWords : undefined,
+  };
+};
+
+const endsWithProperPunctuation = (text: string): boolean => {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return false;
+  const lastChar = trimmed[trimmed.length - 1];
+  return /[.!?;:]/.test(lastChar);
+};
+
+const shouldMergeWithNext = (text: string): boolean => {
+  const trimmed = text.trim();
+  return trimmed.endsWith(',') || !endsWithProperPunctuation(trimmed);
+};
+
+const enforceNoTrailingCommas = (turns: Turn[]): Turn[] => {
+  const cleaned: Turn[] = [];
+
+  for (let i = 0; i < turns.length; i++) {
+    let current: Turn = {
+      ...turns[i],
+      text: turns[i].text.trim(),
+      words: turns[i].words ? [...turns[i].words!] : undefined,
+    };
+
+    while (shouldMergeWithNext(current.text)) {
+      const next = turns[i + 1];
+      if (
+        next &&
+        next.mode === current.mode &&
+        next.speakerKey === current.speakerKey
+      ) {
+        current = mergeTurns(current, {
+          ...next,
+          text: next.text.trim(),
+          words: next.words ? [...next.words!] : undefined,
+        });
+        i += 1;
+        continue;
+      }
+
+      if (current.text.endsWith(',')) {
+        current = {
+          ...current,
+          text: `${current.text} (continued)`,
+        };
+      }
+
+      break;
+    }
+
+    cleaned.push({
+      ...current,
+      text: normalizeWhitespace(current.text),
+    });
+  }
+
+  return cleaned;
+};
+
+const extractSpeakerTurns = (rawResult: unknown): Turn[] => {
+  const utterances = (rawResult as { results?: { utterances?: DeepgramUtterance[] } })?.results?.utterances ?? [];
+
+  return utterances
+    .filter((utterance): utterance is DeepgramUtterance => {
+      return typeof utterance?.start === 'number' && typeof utterance?.end === 'number';
+    })
+    .map((utterance) => {
+      const text = normalizeWhitespace(utterance.transcript ?? '');
+      return {
+        start: utterance.start,
+        end: utterance.end,
+        text,
+        speakerLabel: resolveSpeakerLabel(utterance.speaker),
+        speakerKey: resolveSpeakerKey(utterance.speaker, utterance.channel),
+        mode: 'speaker' as const,
+        words: utterance.words ? [...utterance.words!] : undefined,
+      } satisfies Turn;
+    })
+    .filter((turn) => turn.text.length > 0);
+};
+
+const extractWordSegments = (rawResult: unknown): Turn[] => {
+  const words = (rawResult as { results?: { channels?: { alternatives?: { words?: DeepgramWord[] }[] }[] } })?.results?.channels?.[0]?.alternatives?.[0]?.words;
+
+  if (!words || !Array.isArray(words) || words.length === 0) {
+    return [];
+  }
+
+  const segments: Turn[] = [];
+  let currentSegment: Turn | null = null;
+
+  const pushCurrentSegment = () => {
+    if (!currentSegment) return;
+    if (currentSegment.text.trim().length === 0) {
+      currentSegment = null;
+      return;
+    }
+
+    const normalizedText = normalizeWhitespace(currentSegment.text);
+    segments.push({
+      ...currentSegment,
+      text: normalizedText,
+      words: currentSegment.words ? [...currentSegment.words!] : undefined,
+    });
+    currentSegment = null;
+  };
+
+  words.forEach((word, index) => {
+    const displayWordRaw = word.punctuated_word ?? word.word;
+    const displayWord = displayWordRaw ? normalizeWhitespace(displayWordRaw) : '';
+
+    if (!displayWord) {
+      return;
+    }
+
+    const wordStart = word.start;
+    const wordEnd = word.end ?? word.start;
+
+    if (!currentSegment) {
+      currentSegment = {
+        start: wordStart,
+        end: wordEnd,
+        text: displayWord,
+        speakerLabel: 'Segment',
+        speakerKey: 'segment',
+        mode: 'segments',
+        words: [word],
+      } satisfies Turn;
+      return;
+    }
+
+    currentSegment = {
+      ...currentSegment,
+      end: wordEnd,
+      text: `${currentSegment.text} ${displayWord}`,
+      words: [...(currentSegment.words ?? []), word],
+    };
+
+    const nextWord = words[index + 1];
+    const nextWordStart = nextWord?.start ?? currentSegment.end;
+    const elapsed = nextWordStart - currentSegment.start;
+    const shouldClose = !nextWord || elapsed >= SEGMENT_DURATION_SECONDS;
+
+    if (shouldClose) {
+      pushCurrentSegment();
+    }
+  });
+
+  pushCurrentSegment();
+
+  return segments;
+};
+
+const formatTranscriptContent = (transcript: string, rawResult: unknown): { text: string; mode: TranscriptMode } => {
+  if (!rawResult) {
+    return { text: transcript, mode: 'plain' };
+  }
+
+  const speakerTurns = extractSpeakerTurns(rawResult);
+
+  if (speakerTurns.length > 0) {
+    const cleanedTurns = enforceNoTrailingCommas(speakerTurns);
+    const formatted = cleanedTurns.map((turn) => {
+      const startTs = formatTimestamp(turn.start);
+      const endTs = formatTimestamp(turn.end);
+      return `[${startTs} - ${endTs}] ${turn.speakerLabel}: ${turn.text}`;
+    });
+
+    if (formatted.length > 0) {
+      return { text: formatted.join('\n'), mode: 'speaker' };
+    }
+  }
+
+  const segments = extractWordSegments(rawResult);
+
+  if (segments.length > 0) {
+    const cleanedSegments = enforceNoTrailingCommas(segments);
+    const formattedSegments = cleanedSegments.map((segment) => {
+      const startTs = formatTimestamp(segment.start);
+      return `[${startTs}] ${segment.text}`;
+    });
+
+    if (formattedSegments.length > 0) {
+      return { text: formattedSegments.join('\n'), mode: 'segments' };
+    }
+  }
+
+  return { text: transcript, mode: 'plain' };
+};
 
 interface TranscriptResultProps {
   transcript: string;
@@ -14,251 +287,14 @@ export default function TranscriptResult({ transcript, rawResult, fileName }: Tr
   const [copied, setCopied] = useState(false);
   const [copiedJson, setCopiedJson] = useState(false);
 
-  const formatTimestamp = (seconds: number): string => {
-    const minutes = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
-
-  const { text: formattedTranscript, mode: transcriptMode } = useMemo<{ text: string; mode: TranscriptMode }>(() => {
-    if (!rawResult) {
-      return { text: transcript, mode: 'plain' };
-    }
-
-    type DeepgramWord = {
-      start: number;
-      end?: number;
-      word: string;
-      punctuated_word?: string;
-      speaker?: number | string;
-    };
-
-    type DeepgramUtterance = {
-      start: number;
-      end: number;
-      channel?: number;
-      speaker?: number | string | null;
-      transcript: string;
-      words?: DeepgramWord[];
-    };
-
-    type Turn = {
-      start: number;
-      end: number;
-      text: string;
-      speakerLabel: string;
-      speakerKey: string;
-      mode: Exclude<TranscriptMode, 'plain'>;
-      words?: DeepgramWord[];
-    };
-
-    const resolveSpeakerLabel = (speaker: number | string | null | undefined): string => {
-      if (speaker === null || speaker === undefined) {
-        return 'Speaker';
-      }
-
-      if (typeof speaker === 'number') {
-        return `Speaker ${speaker + 1}`;
-      }
-
-      const normalized = speaker.toString().trim();
-      if (!normalized) {
-        return 'Speaker';
-      }
-
-      const numericMatch = normalized.match(/(\d+)/);
-      if (numericMatch) {
-        const numericValue = Number(numericMatch[1]);
-        if (!Number.isNaN(numericValue)) {
-          return `Speaker ${numericValue >= 0 ? numericValue + 1 : numericValue}`;
-        }
-      }
-
-      return normalized.replace(/^speaker[_-]?/i, 'Speaker ').trim() || 'Speaker';
-    };
-
-    const resolveSpeakerKey = (speaker: number | string | null | undefined, channel?: number): string => {
-      const speakerValue = speaker === null || speaker === undefined ? 'unknown' : String(speaker);
-      return `${channel ?? 'ch0'}|${speakerValue}`;
-    };
-
-    const normalizeWhitespace = (value: string) => value.replace(/\s+/g, ' ').trim();
-
-    const mergeTurns = (first: Turn, second: Turn): Turn => {
-      const mergedText = normalizeWhitespace(`${first.text} ${second.text}`);
-      const mergedWords = [
-        ...(first.words ?? []),
-        ...(second.words ?? []),
-      ];
-
-      return {
-        ...first,
-        end: Math.max(first.end, second.end),
-        text: mergedText,
-        words: mergedWords.length > 0 ? mergedWords : undefined,
-      };
-    };
-
-    const enforceNoTrailingCommas = (turns: Turn[]): Turn[] => {
-      const cleaned: Turn[] = [];
-
-      for (let i = 0; i < turns.length; i++) {
-        let current: Turn = {
-          ...turns[i],
-          text: turns[i].text.trim(),
-          words: turns[i].words ? [...turns[i].words] : undefined,
-        };
-
-        while (current.text.endsWith(',')) {
-          const next = turns[i + 1];
-          if (
-            next &&
-            next.mode === current.mode &&
-            next.speakerKey === current.speakerKey
-          ) {
-            current = mergeTurns(current, {
-              ...next,
-              text: next.text.trim(),
-              words: next.words ? [...next.words] : undefined,
-            });
-            i += 1;
-            continue;
-          }
-
-          current = {
-            ...current,
-            text: `${current.text} (continued)`,
-          };
-          break;
-        }
-
-        current = {
-          ...current,
-          text: normalizeWhitespace(current.text),
-        };
-
-        cleaned.push(current);
-      }
-
-      return cleaned;
-    };
-
-    const utterances = (rawResult as { results?: { utterances?: DeepgramUtterance[] } })?.results?.utterances ?? [];
-
-    const speakerTurns: Turn[] = utterances
-      .filter((utterance): utterance is DeepgramUtterance => {
-        return typeof utterance?.start === 'number' && typeof utterance?.end === 'number';
-      })
-      .map((utterance) => {
-        const text = normalizeWhitespace(utterance.transcript ?? '');
-        return {
-          start: utterance.start,
-          end: utterance.end,
-          text,
-          speakerLabel: resolveSpeakerLabel(utterance.speaker),
-          speakerKey: resolveSpeakerKey(utterance.speaker, utterance.channel),
-          mode: 'speaker' as const,
-          words: utterance.words ? [...utterance.words] : undefined,
-        };
-      })
-      .filter((turn) => turn.text.length > 0);
-
-    if (speakerTurns.length > 0) {
-      const cleanedTurns = enforceNoTrailingCommas(speakerTurns);
-      const formatted = cleanedTurns.map((turn) => {
-        const startTs = formatTimestamp(turn.start);
-        const endTs = formatTimestamp(turn.end);
-        return `[${startTs} - ${endTs}] ${turn.speakerLabel}: ${turn.text}`;
-      });
-
-      if (formatted.length > 0) {
-        return { text: formatted.join('\n'), mode: 'speaker' };
-      }
-    }
-
-    const words = (rawResult as { results?: { channels?: { alternatives?: { words?: DeepgramWord[] }[] }[] } })?.results?.channels?.[0]?.alternatives?.[0]?.words;
-
-    if (words && Array.isArray(words) && words.length > 0) {
-      const SEGMENT_DURATION = 4; // seconds
-      const segments: Turn[] = [];
-
-      let currentSegment: Turn | null = null;
-
-      const pushCurrentSegment = () => {
-        if (currentSegment && currentSegment.text.trim().length > 0) {
-          const normalizedText = normalizeWhitespace(currentSegment.text);
-          segments.push({
-            ...currentSegment,
-            text: normalizedText,
-            words: currentSegment.words ? [...currentSegment.words] : undefined,
-          });
-        }
-        currentSegment = null;
-      };
-
-      words.forEach((word, index) => {
-        const displayWordRaw = word.punctuated_word ?? word.word;
-        const displayWord = displayWordRaw ? normalizeWhitespace(displayWordRaw) : '';
-
-        if (!displayWord) {
-          return;
-        }
-
-        const wordStart = word.start;
-        const wordEnd = word.end ?? word.start;
-
-        if (!currentSegment) {
-          currentSegment = {
-            start: wordStart,
-            end: wordEnd,
-            text: displayWord,
-            speakerLabel: 'Segment',
-            speakerKey: 'segment',
-            mode: 'segments',
-            words: [word],
-          };
-          return;
-        }
-
-        currentSegment.text = `${currentSegment.text} ${displayWord}`;
-        currentSegment.end = wordEnd;
-        currentSegment.words = [...(currentSegment.words ?? []), word];
-
-        const nextWord = words[index + 1];
-        const nextWordStart = nextWord?.start ?? currentSegment.end;
-        const elapsed = nextWordStart - currentSegment.start;
-        const shouldClose = !nextWord || elapsed >= SEGMENT_DURATION;
-
-        if (shouldClose) {
-          pushCurrentSegment();
-        }
-      });
-
-      // Flush remaining segment if any
-      pushCurrentSegment();
-
-      if (segments.length > 0) {
-        const cleanedSegments = enforceNoTrailingCommas(segments);
-        const formattedSegments = cleanedSegments.map((segment) => {
-          const startTs = formatTimestamp(segment.start);
-          return `[${startTs}] ${segment.text}`;
-        });
-
-        if (formattedSegments.length > 0) {
-          return { text: formattedSegments.join('\n'), mode: 'segments' };
-        }
-      }
-    }
-
-    return { text: transcript, mode: 'plain' };
+  const { text: formattedTranscript, mode: transcriptMode } = useMemo(() => {
+    return formatTranscriptContent(transcript, rawResult);
   }, [transcript, rawResult]);
 
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(formattedTranscript);
       setCopied(true);
-      
-      // Reset copied state after 2 seconds
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
       console.error('Failed to copy text: ', err);
@@ -268,12 +304,12 @@ export default function TranscriptResult({ transcript, rawResult, fileName }: Tr
   const downloadTranscript = () => {
     const blob = new Blob([formattedTranscript], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${fileName.replace(/\.[^/.]+$/, '')}_transcript.txt`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${fileName.replace(/\.[^/.]+$/, '')}_transcript.txt`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
     URL.revokeObjectURL(url);
   };
 
@@ -294,16 +330,16 @@ export default function TranscriptResult({ transcript, rawResult, fileName }: Tr
     const jsonString = JSON.stringify(rawResult, null, 2);
     const blob = new Blob([jsonString], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${fileName.replace(/\.[^/.]+$/, '')}_deepgram.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${fileName.replace(/\.[^/.]+$/, '')}_deepgram.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
     URL.revokeObjectURL(url);
   };
 
-  const wordCount = transcript.split(/\s+/).filter(word => word.length > 0).length;
+  const wordCount = transcript.split(/\s+/).filter((word) => word.length > 0).length;
 
   return (
     <div className="space-y-4">
@@ -339,7 +375,7 @@ export default function TranscriptResult({ transcript, rawResult, fileName }: Tr
               Download
             </span>
           </button>
-          {rawResult && (
+          {!!rawResult && (
             <>
               <button
                 onClick={copyRawJson}
@@ -367,7 +403,7 @@ export default function TranscriptResult({ transcript, rawResult, fileName }: Tr
           )}
         </div>
       </div>
-      
+
       <div className="relative">
         <textarea
           value={formattedTranscript}
@@ -384,7 +420,7 @@ export default function TranscriptResult({ transcript, rawResult, fileName }: Tr
           </div>
         </div>
       </div>
-      
+
       <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
         <div className="flex items-center gap-4">
           <span>🤖 Generated by Deepgram AI</span>

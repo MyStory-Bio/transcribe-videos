@@ -91,9 +91,12 @@ async function processVideoAsync(jobId: string, inputPath: string, audioPath: st
     const { result } = await deepgram.listen.prerecorded.transcribeFile(
       audioBuffer,
       {
-        model: 'nova-2',
+        model: 'nova-3',
         smart_format: true,
         punctuate: true,
+        utterances: true,
+        paragraphs: true,
+        diarize: true,
       }
     );
 
